@@ -182,6 +182,48 @@ def to_sql(dataframe, **kwargs):
         sys.stdout.write(f'\r{progress}')
     sys.stdout.write('\n')
 
+def reconnect_database(db_host, db_port, db_user, db_password, db_name):
+    """
+    Reconecta ao banco de dados quando a conexão é perdida
+    """
+    try:
+        # Fechar conexões antigas se existirem
+        try:
+            cur.close()
+            conn.close()
+            engine.dispose()
+        except:
+            pass
+        
+        # Criar nova conexão
+        encoded_password = urllib.parse.quote_plus(db_password)
+        connection_string = f'postgresql+psycopg2://{db_user}:{encoded_password}@{db_host}:{db_port}/{db_name}'
+        engine = create_engine(
+            connection_string,
+            connect_args={
+                "connect_timeout": 10,
+                "application_name": "ETL_CNPJ"
+            },
+            pool_pre_ping=True,
+            pool_recycle=3600
+        )
+        
+        conn = psycopg2.connect(
+            host=db_host,
+            port=db_port,
+            user=db_user,
+            password=db_password,
+            dbname=db_name
+        )
+        cur = conn.cursor()
+        
+        print("✅ Reconexão com banco de dados estabelecida!")
+        return engine, conn, cur
+        
+    except Exception as e:
+        print(f"❌ Erro ao reconectar: {e}")
+        return None, None, None
+
 def test_database_connection(db_host, db_port, db_user, db_password, db_name):
     """
     Testa a conexão com o banco de dados antes de processar
@@ -223,7 +265,7 @@ def test_database_connection(db_host, db_port, db_user, db_password, db_name):
         exists = cur.fetchone()
         
         if not exists:
-            print(f"📄 Banco '{db_name}' não existe. Criando...")
+            print(f"🔄 Banco '{db_name}' não existe. Criando...")
             conn.autocommit = True
             cur.execute(f'CREATE DATABASE "{db_name}"')
             print(f"✅ Banco '{db_name}' criado com sucesso!")
@@ -232,10 +274,7 @@ def test_database_connection(db_host, db_port, db_user, db_password, db_name):
     except Exception as e:
         print(f"⚠️  Aviso ao verificar/criar banco: {e}")
     
-    # Terceiro teste: conectar no banco específico com diferentes métodos
-    print("🔧 Testando diferentes métodos de conexão SQLAlchemy...")
-    
-    # Método 1: URL encoding da senha (mais provável solução)
+    # Terceiro teste: conectar no banco específico
     try:
         encoded_password = urllib.parse.quote_plus(db_password)
         connection_string = f'postgresql+psycopg2://{db_user}:{encoded_password}@{db_host}:{db_port}/{db_name}'
@@ -257,37 +296,8 @@ def test_database_connection(db_host, db_port, db_user, db_password, db_name):
             return engine
             
     except Exception as e:
-        print(f"⚠️  Método 1 (URL encoding) falhou: {e}")
-    
-    # Método 2: Credenciais via connect_args
-    try:
-        connection_string = f'postgresql+psycopg2://{db_host}:{db_port}/{db_name}'
-        engine = create_engine(
-            connection_string,
-            connect_args={
-                "user": db_user,
-                "password": db_password,
-                "host": db_host,
-                "port": db_port,
-                "connect_timeout": 10,
-                "application_name": "ETL_CNPJ"
-            },
-            pool_pre_ping=True,
-            pool_recycle=3600
-        )
-        
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT version()"))
-            version = result.fetchone()[0]
-            print(f"✅ Conexão com '{db_name}' estabelecida!")
-            print(f"📊 PostgreSQL: {version.split(',')[0]}")
-            return engine
-            
-    except Exception as e:
-        print(f"⚠️  Método 2 (connect_args) falhou: {e}")
-    
-    print(f"❌ Todos os métodos de conexão SQLAlchemy falharam")
-    return None
+        print(f"❌ Erro na conexão SQLAlchemy: {e}")
+        return None
 
 def load_env_config():
     """
@@ -298,7 +308,7 @@ def load_env_config():
     
     if not os.path.isfile(dotenv_path):
         print('❌ Arquivo .env não encontrado no diretório atual.')
-        print('📁 Especifique o local do seu arquivo de configuração ".env":')
+        print('🔍 Especifique o local do seu arquivo de configuração ".env":')
         print('   Exemplo: C:\\...\\Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ\\')
         local_env = input('Caminho: ')
         dotenv_path = os.path.join(local_env, '.env')
@@ -307,7 +317,7 @@ def load_env_config():
             print(f'❌ Arquivo .env não encontrado em: {dotenv_path}')
             return None
     
-    print(f"📄 Carregando configurações de: {dotenv_path}")
+    print(f"🔄 Carregando configurações de: {dotenv_path}")
     load_dotenv(dotenv_path=dotenv_path)
     
     # Validar variáveis obrigatórias
@@ -346,7 +356,7 @@ print("""
 ║  🔄 Pipeline ETL para dados públicos de CNPJ da Receita Federal             ║
 ║  📊 Processa ~50 milhões de empresas em PostgreSQL                          ║
 ║                                                                              ║
-║  Desenvolvido por: Victor Beppler                                              ║
+║  Desenvolvido por: Victor Beppler                                           ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """)
 
@@ -409,7 +419,7 @@ try:
         print("\n❌ Não foi possível estabelecer conexão com o banco. Encerrando...")
         sys.exit(1)
         
-    # Criar conexão psycopg2 para comandos DDL (sabemos que funciona)
+    # Criar conexão psycopg2 para comandos DDL
     conn = psycopg2.connect(
         host=db_host,
         port=db_port,
@@ -619,240 +629,613 @@ print(f"    - Qualificação: {len(arquivos_quals)} arquivo(s)")
 # PROCESSAR ARQUIVOS DE EMPRESA
 # ===============================================
 
-empresa_insert_start = time.time()
-print(f"\n{'='*60}")
-print("🏢 PROCESSANDO ARQUIVOS DE EMPRESA")
-print(f"{'='*60}")
+# empresa_insert_start = time.time()
+# print(f"\n{'='*60}")
+# print("🏢 PROCESSANDO ARQUIVOS DE EMPRESA")
+# print(f"{'='*60}")
 
-# Drop table antes do insert
-try:
-    cur.execute('DROP TABLE IF EXISTS "empresa";')
-    conn.commit()
-    print("🗑️  Tabela 'empresa' removida (se existia)")
-except Exception as e:
-    print(f"⚠️  Aviso ao remover tabela empresa: {e}")
+# # Drop table antes do insert
+# try:
+#     cur.execute('DROP TABLE IF EXISTS "empresa";')
+#     conn.commit()
+#     print("🗑️  Tabela 'empresa' removida (se existia)")
+# except Exception as e:
+#     print(f"⚠️  Aviso ao remover tabela empresa: {e}")
+#     # Reconectar se necessário
+#     engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
 
-for e, arquivo in enumerate(arquivos_empresa, 1):
-    print(f'📄 Processando arquivo {e}/{len(arquivos_empresa)}: {arquivo}')
-    try:
-        # Limpar memória
-        try:
-            del empresa
-            gc.collect()
-        except:
-            pass
+# for e, arquivo in enumerate(arquivos_empresa, 1):
+#     print(f'📄 Processando arquivo {e}/{len(arquivos_empresa)}: {arquivo}')
+#     try:
+#         # Limpar memória
+#         try:
+#             del empresa
+#             gc.collect()
+#         except:
+#             pass
 
-        empresa_dtypes = {0: object, 1: object, 2: 'Int32', 3: 'Int32', 4: object, 5: 'Int32', 6: object}
-        extracted_file_path = os.path.join(extracted_files, arquivo)
+#         empresa_dtypes = {0: object, 1: object, 2: 'Int32', 3: 'Int32', 4: object, 5: 'Int32', 6: object}
+#         extracted_file_path = os.path.join(extracted_files, arquivo)
 
-        empresa = pd.read_csv(
-            filepath_or_buffer=extracted_file_path,
-            sep=';',
-            skiprows=0,
-            header=None,
-            dtype=empresa_dtypes,
-            encoding='latin-1',
-        )
+#         empresa = pd.read_csv(
+#             filepath_or_buffer=extracted_file_path,
+#             sep=';',
+#             skiprows=0,
+#             header=None,
+#             dtype=empresa_dtypes,
+#             encoding='latin-1',
+#         )
 
-        # Tratamento do arquivo
-        empresa = empresa.reset_index()
-        del empresa['index']
+#         # Tratamento do arquivo
+#         empresa = empresa.reset_index()
+#         del empresa['index']
 
-        # Renomear colunas
-        empresa.columns = ['cnpj_basico', 'razao_social', 'natureza_juridica', 
-                          'qualificacao_responsavel', 'capital_social', 'porte_empresa', 
-                          'ente_federativo_responsavel']
+#         # Renomear colunas
+#         empresa.columns = ['cnpj_basico', 'razao_social', 'natureza_juridica', 
+#                           'qualificacao_responsavel', 'capital_social', 'porte_empresa', 
+#                           'ente_federativo_responsavel']
 
-        # Tratar capital social
-        empresa['capital_social'] = empresa['capital_social'].apply(lambda x: x.replace(',','.'))
-        empresa['capital_social'] = empresa['capital_social'].astype(float)
+#         # Tratar capital social
+#         empresa['capital_social'] = empresa['capital_social'].apply(lambda x: x.replace(',','.'))
+#         empresa['capital_social'] = empresa['capital_social'].astype(float)
 
-        # Gravar dados no banco
-        print(f"    💾 Inserindo {len(empresa)} registros no banco...")
-        to_sql(empresa, name='empresa', con=engine, if_exists='append', index=False)
-        print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+#         # Gravar dados no banco
+#         print(f"    💾 Inserindo {len(empresa)} registros no banco...")
+#         to_sql(empresa, name='empresa', con=engine, if_exists='append', index=False)
+#         print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
 
-    except Exception as error:
-        print(f'    ❌ Erro ao processar {arquivo}: {error}')
-        continue
+#     except Exception as error:
+#         print(f'    ❌ Erro ao processar {arquivo}: {error}')
+#         continue
 
-# Limpar memória
-try:
-    del empresa
-    gc.collect()
-except:
-    pass
+# # Limpar memória
+# try:
+#     del empresa
+#     gc.collect()
+# except:
+#     pass
 
-empresa_insert_end = time.time()
-empresa_tempo_insert = round(empresa_insert_end - empresa_insert_start)
-print(f'\n⏱️  Tempo de processamento de empresas: {empresa_tempo_insert} segundos')
+# empresa_insert_end = time.time()
+# empresa_tempo_insert = round(empresa_insert_end - empresa_insert_start)
+# print(f'\n⏱️  Tempo de processamento de empresas: {empresa_tempo_insert} segundos')
 
 # ===============================================
 # PROCESSAR ARQUIVOS DE ESTABELECIMENTO
 # ===============================================
 
-estabelecimento_insert_start = time.time()
-print(f"\n{'='*60}")
-print("🏪 PROCESSANDO ARQUIVOS DE ESTABELECIMENTO")
-print(f"{'='*60}")
+# estabelecimento_insert_start = time.time()
+# print(f"\n{'='*60}")
+# print("🏪 PROCESSANDO ARQUIVOS DE ESTABELECIMENTO")
+# print(f"{'='*60}")
 
-# Drop table antes do insert
-try:
-    cur.execute('DROP TABLE IF EXISTS "estabelecimento";')
-    conn.commit()
-    print("🗑️  Tabela 'estabelecimento' removida (se existia)")
-except Exception as e:
-    print(f"⚠️  Aviso ao remover tabela estabelecimento: {e}")
+# # Drop table antes do insert
+# try:
+#     cur.execute('DROP TABLE IF EXISTS "estabelecimento";')
+#     conn.commit()
+#     print("🗑️  Tabela 'estabelecimento' removida (se existia)")
+# except Exception as e:
+#     print(f"⚠️  Aviso ao remover tabela estabelecimento: {e}")
+#     # Reconectar se necessário
+#     engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
 
-print(f'📊 Total de arquivos de estabelecimento: {len(arquivos_estabelecimento)}')
+# print(f'📊 Total de arquivos de estabelecimento: {len(arquivos_estabelecimento)}')
 
-for e, arquivo in enumerate(arquivos_estabelecimento, 1):
-    print(f'📄 Processando arquivo {e}/{len(arquivos_estabelecimento)}: {arquivo}')
-    try:
-        # Limpar memória
-        try:
-            del estabelecimento
-            gc.collect()
-        except:
-            pass
+# for e, arquivo in enumerate(arquivos_estabelecimento, 1):
+#     print(f'📄 Processando arquivo {e}/{len(arquivos_estabelecimento)}: {arquivo}')
+#     try:
+#         # Limpar memória
+#         try:
+#             del estabelecimento
+#             gc.collect()
+#         except:
+#             pass
 
-        estabelecimento_dtypes = {0: object, 1: object, 2: object, 3: 'Int32', 4: object, 5: 'Int32', 6: 'Int32',
-                                  7: 'Int32', 8: object, 9: object, 10: 'Int32', 11: 'Int32', 12: object, 13: object,
-                                  14: object, 15: object, 16: object, 17: object, 18: object, 19: object,
-                                  20: 'Int32', 21: object, 22: object, 23: object, 24: object, 25: object,
-                                  26: object, 27: object, 28: object, 29: 'Int32'}
+#         estabelecimento_dtypes = {0: object, 1: object, 2: object, 3: 'Int32', 4: object, 5: 'Int32', 6: 'Int32',
+#                                   7: 'Int32', 8: object, 9: object, 10: 'Int32', 11: 'Int32', 12: object, 13: object,
+#                                   14: object, 15: object, 16: object, 17: object, 18: object, 19: object,
+#                                   20: 'Int32', 21: object, 22: object, 23: object, 24: object, 25: object,
+#                                   26: object, 27: object, 28: object, 29: 'Int32'}
         
-        extracted_file_path = os.path.join(extracted_files, arquivo)
+#         extracted_file_path = os.path.join(extracted_files, arquivo)
 
-        # Processar em lotes devido ao tamanho
-        NROWS = 2000000
-        part = 0
+#         # Processar em lotes devido ao tamanho
+#         NROWS = 2000000
+#         part = 0
         
-        while True:
-            print(f"    📦 Processando lote {part + 1}...")
+#         while True:
+#             print(f"    📦 Processando lote {part + 1}...")
             
-            estabelecimento = pd.read_csv(
-                filepath_or_buffer=extracted_file_path,
-                sep=';',
-                nrows=NROWS,
-                skiprows=NROWS * part,
-                header=None,
-                dtype=estabelecimento_dtypes,
-                encoding='latin-1',
-            )
+#             estabelecimento = pd.read_csv(
+#                 filepath_or_buffer=extracted_file_path,
+#                 sep=';',
+#                 nrows=NROWS,
+#                 skiprows=NROWS * part,
+#                 header=None,
+#                 dtype=estabelecimento_dtypes,
+#                 encoding='latin-1',
+#             )
 
-            # Se chegou ao fim do arquivo
-            if len(estabelecimento) == 0:
-                break
+#             # Se chegou ao fim do arquivo
+#             if len(estabelecimento) == 0:
+#                 break
 
-            # Tratamento do arquivo
-            estabelecimento = estabelecimento.reset_index()
-            del estabelecimento['index']
-            gc.collect()
+#             # Tratamento do arquivo
+#             estabelecimento = estabelecimento.reset_index()
+#             del estabelecimento['index']
+#             gc.collect()
 
-            # Renomear colunas
-            estabelecimento.columns = ['cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial',
-                                       'nome_fantasia', 'situacao_cadastral', 'data_situacao_cadastral',
-                                       'motivo_situacao_cadastral', 'nome_cidade_exterior', 'pais',
-                                       'data_inicio_atividade', 'cnae_fiscal_principal', 'cnae_fiscal_secundaria',
-                                       'tipo_logradouro', 'logradouro', 'numero', 'complemento', 'bairro',
-                                       'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1', 'ddd_2', 'telefone_2',
-                                       'ddd_fax', 'fax', 'correio_eletronico', 'situacao_especial', 'data_situacao_especial']
+#             # Renomear colunas
+#             estabelecimento.columns = ['cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial',
+#                                        'nome_fantasia', 'situacao_cadastral', 'data_situacao_cadastral',
+#                                        'motivo_situacao_cadastral', 'nome_cidade_exterior', 'pais',
+#                                        'data_inicio_atividade', 'cnae_fiscal_principal', 'cnae_fiscal_secundaria',
+#                                        'tipo_logradouro', 'logradouro', 'numero', 'complemento', 'bairro',
+#                                        'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1', 'ddd_2', 'telefone_2',
+#                                        'ddd_fax', 'fax', 'correio_eletronico', 'situacao_especial', 'data_situacao_especial']
 
-            # Gravar dados no banco
-            print(f"        💾 Inserindo {len(estabelecimento)} registros...")
-            to_sql(estabelecimento, name='estabelecimento', con=engine, if_exists='append', index=False)
-            print(f'        ✅ Lote {part + 1} inserido com sucesso!')
+#             # Gravar dados no banco
+#             print(f"        💾 Inserindo {len(estabelecimento)} registros...")
+#             to_sql(estabelecimento, name='estabelecimento', con=engine, if_exists='append', index=False)
+#             print(f'        ✅ Lote {part + 1} inserido com sucesso!')
             
-            if len(estabelecimento) < NROWS:
-                break
+#             if len(estabelecimento) < NROWS:
+#                 break
                 
-            part += 1
+#             part += 1
 
-    except Exception as error:
-        print(f'    ❌ Erro ao processar {arquivo}: {error}')
-        continue
+#     except Exception as error:
+#         print(f'    ❌ Erro ao processar {arquivo}: {error}')
+#         continue
 
-# Limpar memória
-try:
-    del estabelecimento
-    gc.collect()
-except:
-    pass
+# # Limpar memória
+# try:
+#     del estabelecimento
+#     gc.collect()
+# except:
+#     pass
 
-estabelecimento_insert_end = time.time()
-estabelecimento_tempo_insert = round(estabelecimento_insert_end - estabelecimento_insert_start)
-print(f'\n⏱️  Tempo de processamento de estabelecimentos: {estabelecimento_tempo_insert} segundos')
+# estabelecimento_insert_end = time.time()
+# estabelecimento_tempo_insert = round(estabelecimento_insert_end - estabelecimento_insert_start)
+# print(f'\n⏱️  Tempo de processamento de estabelecimentos: {estabelecimento_tempo_insert} segundos')
 
-# ===============================================
+# ==== ===========================================
 # PROCESSAR ARQUIVOS DE SÓCIOS
 # ===============================================
 
-socios_insert_start = time.time()
-print(f"\n{'='*60}")
-print("👥 PROCESSANDO ARQUIVOS DE SÓCIOS")
-print(f"{'='*60}")
+# socios_insert_start = time.time()
+# print(f"\n{'='*60}")
+# print("👥 PROCESSANDO ARQUIVOS DE SÓCIOS")
+# print(f"{'='*60}")
 
-# Drop table antes do insert
-try:
-    cur.execute('DROP TABLE IF EXISTS "socios";')
-    conn.commit()
-    print("🗑️  Tabela 'socios' removida (se existia)")
-except Exception as e:
-    print(f"⚠️  Aviso ao remover tabela socios: {e}")
+# # Drop table antes do insert
+# try:
+#     cur.execute('DROP TABLE IF EXISTS "socios";')
+#     conn.commit()
+#     print("🗑️  Tabela 'socios' removida (se existia)")
+# except Exception as e:
+#     print(f"⚠️  Aviso ao remover tabela socios: {e}")
+#     # Reconectar se necessário
+#     engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
 
-for e, arquivo in enumerate(arquivos_socios, 1):
-    print(f'📄 Processando arquivo {e}/{len(arquivos_socios)}: {arquivo}')
+# for e, arquivo in enumerate(arquivos_socios, 1):
+#     print(f'📄 Processando arquivo {e}/{len(arquivos_socios)}: {arquivo}')
+#     try:
+#         # Limpar memória
+#         try:
+#             del socios
+#             gc.collect()
+#         except:
+#             pass
+
+#         socios_dtypes = {0: object, 1: 'Int32', 2: object, 3: object, 4: 'Int32', 5: 'Int32', 6: 'Int32',
+#                          7: object, 8: object, 9: 'Int32', 10: 'Int32'}
+        
+#         extracted_file_path = os.path.join(extracted_files, arquivo)
+        
+#         socios = pd.read_csv(
+#             filepath_or_buffer=extracted_file_path,
+#             sep=';',
+#             skiprows=0,
+#             header=None,
+#             dtype=socios_dtypes,
+#             encoding='latin-1',
+#         )
+
+#         # Tratamento do arquivo
+#         socios = socios.reset_index()
+#         del socios['index']
+
+#         # Renomear colunas
+#         socios.columns = ['cnpj_basico', 'identificador_socio', 'nome_socio_razao_social', 'cpf_cnpj_socio',
+#                           'qualificacao_socio', 'data_entrada_sociedade', 'pais', 'representante_legal',
+#                           'nome_do_representante', 'qualificacao_representante_legal', 'faixa_etaria']
+
+#         # Gravar dados no banco
+#         print(f"    💾 Inserindo {len(socios)} registros no banco...")
+#         to_sql(socios, name='socios', con=engine, if_exists='append', index=False)
+#         print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+
+#     except Exception as error:
+#         print(f'    ❌ Erro ao processar {arquivo}: {error}')
+#         continue
+
+# # Limpar memória
+# try:
+#     del socios
+#     gc.collect()
+# except:
+#     pass
+
+# socios_insert_end = time.time()
+# socios_tempo_insert = round(socios_insert_end - socios_insert_start)
+# print(f'\n⏱️  Tempo de processamento de sócios: {socios_tempo_insert} segundos')
+
+# ===============================================
+# PROCESSAR ARQUIVOS DE SIMPLES
+# ===============================================
+
+if arquivos_simples:
+    simples_insert_start = time.time()
+    print(f"\n{'='*60}")
+    print("📊 PROCESSANDO ARQUIVOS DO SIMPLES NACIONAL")
+    print(f"{'='*60}")
+
+    # Drop table antes do insert
     try:
-        # Limpar memória
+        cur.execute('DROP TABLE IF EXISTS "simples";')
+        conn.commit()
+        print("🗑️  Tabela 'simples' removida (se existia)")
+    except Exception as e:
+        print(f"⚠️  Aviso ao remover tabela simples: {e}")
+        engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
+
+    for e, arquivo in enumerate(arquivos_simples, 1):
+        print(f'📄 Processando arquivo {e}/{len(arquivos_simples)}: {arquivo}')
         try:
-            del socios
-            gc.collect()
-        except:
-            pass
+            # Verificar tamanho do arquivo
+            extracted_file_path = os.path.join(extracted_files, arquivo)
+            simples_length = sum(1 for line in open(extracted_file_path, "r", encoding='latin-1'))
+            print(f'    📊 Linhas no arquivo: {simples_length}')
+            
+            tamanho_das_partes = 1000000
+            partes = max(1, simples_length // tamanho_das_partes + 1)
+            print(f'    📦 Arquivo será dividido em {partes} parte(s)')
+            
+            simples_dtypes = {0: object, 1: object, 2: 'Int32', 3: 'Int32', 4: object, 5: 'Int32', 6: 'Int32'}
+            
+            for i in range(partes):
+                print(f'        📦 Processando parte {i+1}/{partes}...')
+                
+                simples = pd.read_csv(
+                    filepath_or_buffer=extracted_file_path,
+                    sep=';',
+                    nrows=tamanho_das_partes,
+                    skiprows=tamanho_das_partes * i,
+                    header=None,
+                    dtype=simples_dtypes,
+                    encoding='latin-1',
+                )
+                
+                if len(simples) == 0:
+                    break
+                
+                # Tratamento do arquivo
+                simples = simples.reset_index()
+                del simples['index']
+                
+                # Renomear colunas
+                simples.columns = ['cnpj_basico', 'opcao_pelo_simples', 'data_opcao_simples',
+                                  'data_exclusao_simples', 'opcao_mei', 'data_opcao_mei', 'data_exclusao_mei']
+                
+                # Gravar dados no banco
+                print(f"            💾 Inserindo {len(simples)} registros...")
+                to_sql(simples, name='simples', con=engine, if_exists='append', index=False)
+                print(f'            ✅ Parte {i+1} inserida com sucesso!')
+                
+                # Limpar memória
+                del simples
+                gc.collect()
+                
+        except Exception as error:
+            print(f'    ❌ Erro ao processar {arquivo}: {error}')
+            continue
+    
+    simples_insert_end = time.time()
+    simples_tempo_insert = round(simples_insert_end - simples_insert_start)
+    print(f'\n⏱️  Tempo de processamento do Simples: {simples_tempo_insert} segundos')
 
-        socios_dtypes = {0: object, 1: 'Int32', 2: object, 3: object, 4: 'Int32', 5: 'Int32', 6: 'Int32',
-                         7: object, 8: object, 9: 'Int32', 10: 'Int32'}
-        
-        extracted_file_path = os.path.join(extracted_files, arquivo)
-        
-        socios = pd.read_csv(
-            filepath_or_buffer=extracted_file_path,
-            sep=';',
-            skiprows=0,
-            header=None,
-            dtype=socios_dtypes,
-            encoding='latin-1',
-        )
+# ===============================================
+# PROCESSAR ARQUIVOS DE CNAE
+# ===============================================
 
-        # Tratamento do arquivo
-        socios = socios.reset_index()
-        del socios['index']
+if arquivos_cnae:
+    cnae_insert_start = time.time()
+    print(f"\n{'='*60}")
+    print("🏭 PROCESSANDO ARQUIVOS DE CNAE")
+    print(f"{'='*60}")
 
-        # Renomear colunas
-        socios.columns = ['cnpj_basico', 'identificador_socio', 'nome_socio_razao_social', 'cpf_cnpj_socio',
-                          'qualificacao_socio', 'data_entrada_sociedade', 'pais', 'representante_legal',
-                          'nome_do_representante', 'qualificacao_representante_legal', 'faixa_etaria']
+    try:
+        cur.execute('DROP TABLE IF EXISTS "cnae";')
+        conn.commit()
+        print("🗑️  Tabela 'cnae' removida (se existia)")
+    except Exception as e:
+        print(f"⚠️  Aviso ao remover tabela cnae: {e}")
+        engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
 
-        # Gravar dados no banco
-        print(f"    💾 Inserindo {len(socios)} registros no banco...")
-        to_sql(socios, name='socios', con=engine, if_exists='append', index=False)
-        print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+    for e, arquivo in enumerate(arquivos_cnae, 1):
+        print(f'📄 Processando arquivo {e}/{len(arquivos_cnae)}: {arquivo}')
+        try:
+            extracted_file_path = os.path.join(extracted_files, arquivo)
+            cnae = pd.read_csv(
+                filepath_or_buffer=extracted_file_path,
+                sep=';',
+                skiprows=0,
+                header=None,
+                dtype='object',
+                encoding='latin-1'
+            )
+            
+            cnae = cnae.reset_index()
+            del cnae['index']
+            
+            cnae.columns = ['codigo', 'descricao']
+            
+            print(f"    💾 Inserindo {len(cnae)} registros no banco...")
+            to_sql(cnae, name='cnae', con=engine, if_exists='append', index=False)
+            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            
+        except Exception as error:
+            print(f'    ❌ Erro ao processar {arquivo}: {error}')
+            continue
+    
+    cnae_insert_end = time.time()
+    cnae_tempo_insert = round(cnae_insert_end - cnae_insert_start)
+    print(f'\n⏱️  Tempo de processamento de CNAE: {cnae_tempo_insert} segundos')
 
-    except Exception as error:
-        print(f'    ❌ Erro ao processar {arquivo}: {error}')
-        continue
+# ===============================================
+# PROCESSAR ARQUIVOS DE MOTIVOS
+# ===============================================
 
-# Limpar memória
-try:
-    del socios
-    gc.collect()
-except:
-    pass
+if arquivos_moti:
+    moti_insert_start = time.time()
+    print(f"\n{'='*60}")
+    print("📋 PROCESSANDO ARQUIVOS DE MOTIVOS")
+    print(f"{'='*60}")
 
-socios_insert_end = time.time()
-socios_tempo_insert = round(socios_insert_end - socios_insert_start)
-print(f'\n⏱️  Tempo de processamento de sócios: {socios_tempo_insert} segundos')
+    try:
+        cur.execute('DROP TABLE IF EXISTS "moti";')
+        conn.commit()
+        print("🗑️  Tabela 'moti' removida (se existia)")
+    except Exception as e:
+        print(f"⚠️  Aviso ao remover tabela moti: {e}")
+        engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
+
+    for e, arquivo in enumerate(arquivos_moti, 1):
+        print(f'📄 Processando arquivo {e}/{len(arquivos_moti)}: {arquivo}')
+        try:
+            moti_dtypes = {0: 'Int32', 1: object}
+            extracted_file_path = os.path.join(extracted_files, arquivo)
+            moti = pd.read_csv(
+                filepath_or_buffer=extracted_file_path,
+                sep=';',
+                skiprows=0,
+                header=None,
+                dtype=moti_dtypes,
+                encoding='latin-1'
+            )
+            
+            moti = moti.reset_index()
+            del moti['index']
+            
+            moti.columns = ['codigo', 'descricao']
+            
+            print(f"    💾 Inserindo {len(moti)} registros no banco...")
+            to_sql(moti, name='moti', con=engine, if_exists='append', index=False)
+            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            
+        except Exception as error:
+            print(f'    ❌ Erro ao processar {arquivo}: {error}')
+            continue
+    
+    moti_insert_end = time.time()
+    moti_tempo_insert = round(moti_insert_end - moti_insert_start)
+    print(f'\n⏱️  Tempo de processamento de Motivos: {moti_tempo_insert} segundos')
+
+# ===============================================
+# PROCESSAR ARQUIVOS DE MUNICÍPIOS
+# ===============================================
+
+if arquivos_munic:
+    munic_insert_start = time.time()
+    print(f"\n{'='*60}")
+    print("🏙️ PROCESSANDO ARQUIVOS DE MUNICÍPIOS")
+    print(f"{'='*60}")
+
+    try:
+        cur.execute('DROP TABLE IF EXISTS "munic";')
+        conn.commit()
+        print("🗑️  Tabela 'munic' removida (se existia)")
+    except Exception as e:
+        print(f"⚠️  Aviso ao remover tabela munic: {e}")
+        engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
+
+    for e, arquivo in enumerate(arquivos_munic, 1):
+        print(f'📄 Processando arquivo {e}/{len(arquivos_munic)}: {arquivo}')
+        try:
+            munic_dtypes = {0: 'Int32', 1: object}
+            extracted_file_path = os.path.join(extracted_files, arquivo)
+            munic = pd.read_csv(
+                filepath_or_buffer=extracted_file_path,
+                sep=';',
+                skiprows=0,
+                header=None,
+                dtype=munic_dtypes,
+                encoding='latin-1'
+            )
+            
+            munic = munic.reset_index()
+            del munic['index']
+            
+            munic.columns = ['codigo', 'descricao']
+            
+            print(f"    💾 Inserindo {len(munic)} registros no banco...")
+            to_sql(munic, name='munic', con=engine, if_exists='append', index=False)
+            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            
+        except Exception as error:
+            print(f'    ❌ Erro ao processar {arquivo}: {error}')
+            continue
+    
+    munic_insert_end = time.time()
+    munic_tempo_insert = round(munic_insert_end - munic_insert_start)
+    print(f'\n⏱️  Tempo de processamento de Municípios: {munic_tempo_insert} segundos')
+
+# ===============================================
+# PROCESSAR ARQUIVOS DE NATUREZA JURÍDICA
+# ===============================================
+
+if arquivos_natju:
+    natju_insert_start = time.time()
+    print(f"\n{'='*60}")
+    print("⚖️ PROCESSANDO ARQUIVOS DE NATUREZA JURÍDICA")
+    print(f"{'='*60}")
+
+    try:
+        cur.execute('DROP TABLE IF EXISTS "natju";')
+        conn.commit()
+        print("🗑️  Tabela 'natju' removida (se existia)")
+    except Exception as e:
+        print(f"⚠️  Aviso ao remover tabela natju: {e}")
+        engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
+
+    for e, arquivo in enumerate(arquivos_natju, 1):
+        print(f'📄 Processando arquivo {e}/{len(arquivos_natju)}: {arquivo}')
+        try:
+            natju_dtypes = {0: 'Int32', 1: object}
+            extracted_file_path = os.path.join(extracted_files, arquivo)
+            natju = pd.read_csv(
+                filepath_or_buffer=extracted_file_path,
+                sep=';',
+                skiprows=0,
+                header=None,
+                dtype=natju_dtypes,
+                encoding='latin-1'
+            )
+            
+            natju = natju.reset_index()
+            del natju['index']
+            
+            natju.columns = ['codigo', 'descricao']
+            
+            print(f"    💾 Inserindo {len(natju)} registros no banco...")
+            to_sql(natju, name='natju', con=engine, if_exists='append', index=False)
+            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            
+        except Exception as error:
+            print(f'    ❌ Erro ao processar {arquivo}: {error}')
+            continue
+    
+    natju_insert_end = time.time()
+    natju_tempo_insert = round(natju_insert_end - natju_insert_start)
+    print(f'\n⏱️  Tempo de processamento de Natureza Jurídica: {natju_tempo_insert} segundos')
+
+# ===============================================
+# PROCESSAR ARQUIVOS DE PAÍS
+# ===============================================
+
+if arquivos_pais:
+    pais_insert_start = time.time()
+    print(f"\n{'='*60}")
+    print("🌍 PROCESSANDO ARQUIVOS DE PAÍS")
+    print(f"{'='*60}")
+
+    try:
+        cur.execute('DROP TABLE IF EXISTS "pais";')
+        conn.commit()
+        print("🗑️  Tabela 'pais' removida (se existia)")
+    except Exception as e:
+        print(f"⚠️  Aviso ao remover tabela pais: {e}")
+        engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
+
+    for e, arquivo in enumerate(arquivos_pais, 1):
+        print(f'📄 Processando arquivo {e}/{len(arquivos_pais)}: {arquivo}')
+        try:
+            pais_dtypes = {0: 'Int32', 1: object}
+            extracted_file_path = os.path.join(extracted_files, arquivo)
+            pais = pd.read_csv(
+                filepath_or_buffer=extracted_file_path,
+                sep=';',
+                skiprows=0,
+                header=None,
+                dtype=pais_dtypes,
+                encoding='latin-1'
+            )
+            
+            pais = pais.reset_index()
+            del pais['index']
+            
+            pais.columns = ['codigo', 'descricao']
+            
+            print(f"    💾 Inserindo {len(pais)} registros no banco...")
+            to_sql(pais, name='pais', con=engine, if_exists='append', index=False)
+            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            
+        except Exception as error:
+            print(f'    ❌ Erro ao processar {arquivo}: {error}')
+            continue
+    
+    pais_insert_end = time.time()
+    pais_tempo_insert = round(pais_insert_end - pais_insert_start)
+    print(f'\n⏱️  Tempo de processamento de País: {pais_tempo_insert} segundos')
+
+# ===============================================
+# PROCESSAR ARQUIVOS DE QUALIFICAÇÃO
+# ===============================================
+
+if arquivos_quals:
+    quals_insert_start = time.time()
+    print(f"\n{'='*60}")
+    print("👔 PROCESSANDO ARQUIVOS DE QUALIFICAÇÃO DE SÓCIOS")
+    print(f"{'='*60}")
+
+    try:
+        cur.execute('DROP TABLE IF EXISTS "quals";')
+        conn.commit()
+        print("🗑️  Tabela 'quals' removida (se existia)")
+    except Exception as e:
+        print(f"⚠️  Aviso ao remover tabela quals: {e}")
+        engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
+
+    for e, arquivo in enumerate(arquivos_quals, 1):
+        print(f'📄 Processando arquivo {e}/{len(arquivos_quals)}: {arquivo}')
+        try:
+            quals_dtypes = {0: 'Int32', 1: object}
+            extracted_file_path = os.path.join(extracted_files, arquivo)
+            quals = pd.read_csv(
+                filepath_or_buffer=extracted_file_path,
+                sep=';',
+                skiprows=0,
+                header=None,
+                dtype=quals_dtypes,
+                encoding='latin-1'
+            )
+            
+            quals = quals.reset_index()
+            del quals['index']
+            
+            quals.columns = ['codigo', 'descricao']
+            
+            print(f"    💾 Inserindo {len(quals)} registros no banco...")
+            to_sql(quals, name='quals', con=engine, if_exists='append', index=False)
+            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            
+        except Exception as error:
+            print(f'    ❌ Erro ao processar {arquivo}: {error}')
+            continue
+    
+    quals_insert_end = time.time()
+    quals_tempo_insert = round(quals_insert_end - quals_insert_start)
+    print(f'\n⏱️  Tempo de processamento de Qualificação: {quals_tempo_insert} segundos')
 
 # ===============================================
 # CRIAR ÍNDICES NO BANCO DE DADOS
@@ -864,18 +1247,30 @@ print("🔍 CRIANDO ÍNDICES NO BANCO DE DADOS")
 print(f"{'='*60}")
 
 try:
+    # Reconectar para garantir conexão estável
+    engine, conn, cur = reconnect_database(db_host, db_port, db_user, db_password, db_name)
+    
     print("📊 Criando índices para otimizar consultas...")
-    cur.execute("""
+    
+    # Criar índices para as tabelas principais
+    indices_sql = """
     CREATE INDEX IF NOT EXISTS empresa_cnpj ON empresa(cnpj_basico);
     CREATE INDEX IF NOT EXISTS estabelecimento_cnpj ON estabelecimento(cnpj_basico);
     CREATE INDEX IF NOT EXISTS socios_cnpj ON socios(cnpj_basico);
-    """)
+    """
     
-    # Adicionar índices para simples se existir
+    # Adicionar índice para simples se existir
     if arquivos_simples:
-        cur.execute("CREATE INDEX IF NOT EXISTS simples_cnpj ON simples(cnpj_basico);")
+        indices_sql += "CREATE INDEX IF NOT EXISTS simples_cnpj ON simples(cnpj_basico);"
     
-    conn.commit()
+    # Executar criação de índices
+    for sql_command in indices_sql.strip().split(';'):
+        if sql_command.strip():
+            try:
+                cur.execute(sql_command.strip() + ';')
+                conn.commit()
+            except Exception as e:
+                print(f"⚠️  Aviso ao criar índice: {e}")
     
     print("✅ Índices criados com sucesso nas tabelas:")
     print("    - empresa (cnpj_basico)")
@@ -908,19 +1303,25 @@ print(f"""
     ⏱️  Tempo total de processamento: {total_time:.2f} segundos ({total_time/60:.2f} minutos)
     💾 Banco de dados: {db_name} em {db_host}:{db_port}
 
-✅ Seus dados estão prontos para uso no banco de dados!
+📋 TABELAS PROCESSADAS:
+    ✅ Empresa: {len(arquivos_empresa)} arquivo(s)
+    ✅ Estabelecimento: {len(arquivos_estabelecimento)} arquivo(s)
+    ✅ Sócios: {len(arquivos_socios)} arquivo(s)
+    ✅ Simples: {len(arquivos_simples)} arquivo(s)
+    ✅ CNAE: {len(arquivos_cnae)} arquivo(s)
+    ✅ Motivos: {len(arquivos_moti)} arquivo(s)
+    ✅ Municípios: {len(arquivos_munic)} arquivo(s)
+    ✅ Natureza Jurídica: {len(arquivos_natju)} arquivo(s)
+    ✅ País: {len(arquivos_pais)} arquivo(s)
+    ✅ Qualificação: {len(arquivos_quals)} arquivo(s)
 
-👨‍💻 CRÉDITOS:
-    - Desenvolvido originalmente por: Aphonso Henrique do Amaral Rafael
-    - Melhorado e otimizado por: Victor Beppler
-    - Repositório original: https://github.com/aphonsoar/Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ
-    - Este repositório: https://github.com/victorbeppler/Dados-Publicos---Receita-Federal-Brasil-.git
+✅ Seus dados estão prontos para uso no banco de dados!
 
 💡 DICAS:
     🔧 Para alterar o período: modifique YEAR e MONTH no início do script
     ⚡ Para ajustar velocidade: modifique MAX_DOWNLOAD_WORKERS (1-10)
     🔄 Arquivos já baixados são automaticamente pulados em execuções futuras
-    📝 Configure seu .env para diferentes ambientes (dev/prod)
+    🔍 Configure seu .env para diferentes ambientes (dev/prod)
 
 {'='*80}
 """)
