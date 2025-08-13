@@ -20,6 +20,8 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import threading
+import numpy as np
+from io import StringIO
 
 # Lock para print thread-safe
 print_lock = Lock()
@@ -181,6 +183,274 @@ def to_sql(dataframe, **kwargs):
         progress = f'{name} {percent:.2f}% {index:0{len(str(total))}}/{total}'
         sys.stdout.write(f'\r{progress}')
     sys.stdout.write('\n')
+
+def to_sql_optimized(dataframe, connection, table_name, method='multi', batch_size=10000, commit_interval=50000):
+    """
+    Inserção otimizada no banco de dados usando batch inserts
+    
+    Args:
+        dataframe: DataFrame a ser inserido
+        connection: Conexão com o banco (psycopg2 ou engine)
+        table_name: Nome da tabela de destino
+        method: 'multi' para multi-row insert, 'copy' para COPY FROM
+        batch_size: Tamanho do lote para cada insert
+        commit_interval: Intervalo para commit
+    
+    Returns:
+        Número de registros inseridos
+    """
+    total_rows = len(dataframe)
+    inserted_rows = 0
+    failed_rows = []
+    
+    # Se for engine SQLAlchemy, usar to_sql com chunksize
+    if hasattr(connection, 'connect'):
+        try:
+            # Método otimizado do pandas com chunksize
+            dataframe.to_sql(
+                name=table_name,
+                con=connection,
+                if_exists='append',
+                index=False,
+                method=method,
+                chunksize=batch_size
+            )
+            print(f"    ✅ {total_rows:,} registros inseridos via SQLAlchemy")
+            return total_rows
+        except Exception as e:
+            print(f"    ⚠️ Fallback para método padrão: {e}")
+            # Fallback para método tradicional
+            try:
+                dataframe.to_sql(
+                    name=table_name,
+                    con=connection,
+                    if_exists='append',
+                    index=False,
+                    chunksize=batch_size
+                )
+                return total_rows
+            except Exception as e2:
+                print(f"    ❌ Erro no fallback: {e2}")
+                # Tentar método mais seguro linha por linha
+                return insert_with_error_handling(dataframe, connection, table_name)
+    
+    # Se for conexão psycopg2, usar COPY FROM ou INSERT otimizado
+    elif hasattr(connection, 'cursor'):
+        cur = connection.cursor()
+        
+        if method == 'copy':
+            # Método COPY FROM (mais rápido)
+            try:
+                from io import StringIO
+                
+                # Criar buffer CSV em memória
+                buffer = StringIO()
+                dataframe.to_csv(buffer, index=False, header=False, sep='\t', na_rep='\\N')
+                buffer.seek(0)
+                
+                # Obter colunas
+                columns = dataframe.columns.tolist()
+                
+                # Executar COPY FROM
+                cur.copy_expert(
+                    f"COPY {table_name} ({','.join(columns)}) FROM STDIN WITH CSV DELIMITER E'\\t' NULL '\\N'",
+                    buffer
+                )
+                connection.commit()
+                print(f"    ✅ {total_rows:,} registros inseridos via COPY FROM")
+                return total_rows
+                
+            except Exception as e:
+                print(f"    ⚠️ COPY FROM falhou, usando INSERT: {e}")
+                connection.rollback()
+                method = 'multi'  # Fallback para multi-insert
+        
+        if method == 'multi':
+            # Multi-row INSERT (mais compatível)
+            columns = dataframe.columns.tolist()
+            
+            # Preparar template SQL
+            placeholders = ','.join(['%s'] * len(columns))
+            insert_query = f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})"
+            
+            # Converter DataFrame para lista de tuplas
+            data = dataframe.values.tolist()
+            
+            # Inserir em lotes
+            for i in range(0, len(data), batch_size):
+                batch = data[i:i + batch_size]
+                batch_tuples = [tuple(row) for row in batch]
+                
+                try:
+                    # Execute many para batch insert
+                    cur.executemany(insert_query, batch_tuples)
+                    inserted_rows += len(batch)
+                    
+                    # Commit em intervalos
+                    if inserted_rows % commit_interval == 0:
+                        connection.commit()
+                        percent = (inserted_rows * 100) / total_rows
+                        sys.stdout.write(f'\r        {table_name}: {percent:.1f}% ({inserted_rows:,}/{total_rows:,})')
+                        sys.stdout.flush()
+                        
+                except Exception as e:
+                    print(f"\n        ⚠️ Erro no batch {i//batch_size + 1}: {e}")
+                    connection.rollback()
+                    
+                    # Tentar inserir linha por linha para identificar problemas
+                    batch_inserted = 0
+                    for j, row in enumerate(batch_tuples):
+                        try:
+                            cur.execute(insert_query, row)
+                            inserted_rows += 1
+                            batch_inserted += 1
+                        except Exception as row_error:
+                            failed_rows.append({
+                                'index': i + j,
+                                'error': str(row_error)[:100],
+                                'data_sample': str(row[:3])  # Primeiras 3 colunas para debug
+                            })
+                    
+                    if batch_inserted > 0:
+                        connection.commit()
+                        print(f"        ↳ Recuperado {batch_inserted}/{len(batch)} registros do batch")
+            
+            # Commit final
+            connection.commit()
+            
+            # Mostrar estatísticas finais
+            success_rate = (inserted_rows * 100) / total_rows if total_rows > 0 else 0
+            sys.stdout.write(f'\r        {table_name}: {success_rate:.2f}% ({inserted_rows:,}/{total_rows:,})')
+            
+            if failed_rows:
+                print(f"\n        ⚠️ {len(failed_rows)} registros falharam na inserção")
+                # Mostrar os primeiros erros como exemplo
+                for error in failed_rows[:3]:
+                    print(f"           - Linha {error['index']}: {error['error']}")
+                if len(failed_rows) > 3:
+                    print(f"           ... e mais {len(failed_rows) - 3} erros")
+            else:
+                print(f"\n        ✅ Todos os registros inseridos com sucesso!")
+            
+            return inserted_rows
+    
+    return 0
+
+def insert_with_error_handling(dataframe, engine, table_name):
+    """
+    Inserção linha por linha com tratamento de erros detalhado
+    Mais lento, mas identifica exatamente quais registros falham
+    """
+    print(f"        ⚠️ Usando inserção segura (mais lenta)...")
+    
+    total = len(dataframe)
+    inserted = 0
+    errors = []
+    
+    # Criar chunks menores para não sobrecarregar
+    chunk_size = 1000
+    
+    for start_idx in range(0, total, chunk_size):
+        end_idx = min(start_idx + chunk_size, total)
+        chunk = dataframe.iloc[start_idx:end_idx]
+        
+        try:
+            # Tentar inserir o chunk inteiro
+            chunk.to_sql(
+                name=table_name,
+                con=engine,
+                if_exists='append',
+                index=False,
+                method=None  # Método padrão, mais seguro
+            )
+            inserted += len(chunk)
+            
+        except Exception as e:
+            # Se falhar, inserir linha por linha
+            print(f"        ⚠️ Chunk {start_idx}-{end_idx} falhou, tentando linha por linha...")
+            
+            for idx, row in chunk.iterrows():
+                try:
+                    row_df = pd.DataFrame([row])
+                    row_df.to_sql(
+                        name=table_name,
+                        con=engine,
+                        if_exists='append',
+                        index=False
+                    )
+                    inserted += 1
+                except Exception as row_error:
+                    errors.append({
+                        'index': idx,
+                        'error': str(row_error)[:100]
+                    })
+        
+        # Atualizar progresso
+        percent = (inserted * 100) / total
+        sys.stdout.write(f'\r        Inserção segura: {percent:.1f}% ({inserted:,}/{total:,})')
+        sys.stdout.flush()
+    
+    print()  # Nova linha
+    
+    if errors:
+        print(f"        ❌ {len(errors)} registros falharam:")
+        for err in errors[:5]:  # Mostrar apenas os 5 primeiros
+            print(f"           - Índice {err['index']}: {err['error']}")
+    
+    return inserted
+
+def parallel_insert(dataframe, engine, table_name, num_workers=2, batch_size=10000):
+    """
+    Inserção paralela usando múltiplas conexões
+    
+    Args:
+        dataframe: DataFrame a ser inserido
+        engine: SQLAlchemy engine
+        table_name: Nome da tabela
+        num_workers: Número de workers paralelos
+        batch_size: Tamanho do batch por worker
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import numpy as np
+    
+    # Dividir dataframe em chunks para cada worker
+    chunks = np.array_split(dataframe, num_workers)
+    
+    def insert_chunk(chunk, worker_id):
+        """Inserir um chunk do dataframe"""
+        if len(chunk) == 0:
+            return 0
+            
+        thread_safe_print(f"        [Worker {worker_id}] Inserindo {len(chunk):,} registros...")
+        
+        try:
+            chunk.to_sql(
+                name=table_name,
+                con=engine,
+                if_exists='append',
+                index=False,
+                method='multi',
+                chunksize=batch_size
+            )
+            thread_safe_print(f"        [Worker {worker_id}] ✅ Concluído!")
+            return len(chunk)
+        except Exception as e:
+            thread_safe_print(f"        [Worker {worker_id}] ❌ Erro: {e}")
+            return 0
+    
+    # Executar inserções em paralelo
+    total_inserted = 0
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for i, chunk in enumerate(chunks):
+            future = executor.submit(insert_chunk, chunk, i+1)
+            futures.append(future)
+        
+        # Aguardar conclusão
+        for future in futures:
+            total_inserted += future.result()
+    
+    return total_inserted
 
 def reconnect_database(db_host, db_port, db_user, db_password, db_name):
     """
@@ -367,13 +637,25 @@ if not dotenv_path:
     sys.exit(1)
 
 # CONFIGURAÇÕES DE DOWNLOAD PARALELO
-MAX_DOWNLOAD_WORKERS = 5  # Número de downloads simultâneos (recomendado: 3-10)
-DOWNLOAD_TIMEOUT = 1800  # Timeout para cada download em segundos
+MAX_DOWNLOAD_WORKERS = int(os.getenv('MAX_DOWNLOAD_WORKERS', '5'))  # Número de downloads simultâneos
+DOWNLOAD_TIMEOUT = int(os.getenv('DOWNLOAD_TIMEOUT', '1800'))  # Timeout para cada download em segundos
+
+# CONFIGURAÇÕES DE INSERÇÃO NO BANCO
+DB_INSERT_BATCH_SIZE = int(os.getenv('DB_INSERT_BATCH_SIZE', '10000'))  # Tamanho do lote para insert
+DB_INSERT_METHOD = os.getenv('DB_INSERT_METHOD', 'multi')  # 'multi' para multi-insert, 'copy' para COPY FROM
+DB_INSERT_WORKERS = int(os.getenv('DB_INSERT_WORKERS', '1'))  # Número de workers para inserção paralela
+DB_COMMIT_INTERVAL = int(os.getenv('DB_COMMIT_INTERVAL', '50000'))  # Commitar a cada N registros
 
 print(f"\n⚙️  Configuração de Download:")
 print(f"    - Downloads simultâneos: {MAX_DOWNLOAD_WORKERS}")
 print(f"    - Timeout por arquivo: {DOWNLOAD_TIMEOUT}s")
 print(f"    - Modo: {'Rápido' if MAX_DOWNLOAD_WORKERS >= 5 else 'Conservador'}")
+
+print(f"\n⚙️  Configuração de Inserção no Banco:")
+print(f"    - Tamanho do batch: {DB_INSERT_BATCH_SIZE:,} registros")
+print(f"    - Método: {DB_INSERT_METHOD}")
+print(f"    - Workers paralelos: {DB_INSERT_WORKERS}")
+print(f"    - Intervalo de commit: {DB_COMMIT_INTERVAL:,} registros")
 
 # CONFIGURAR PERÍODO DE DADOS
 YEAR = 2025
@@ -679,10 +961,19 @@ for e, arquivo in enumerate(arquivos_empresa, 1):
         empresa['capital_social'] = empresa['capital_social'].apply(lambda x: x.replace(',','.'))
         empresa['capital_social'] = empresa['capital_social'].astype(float)
 
-        # Gravar dados no banco
-        print(f"    💾 Inserindo {len(empresa)} registros no banco...")
-        to_sql(empresa, name='empresa', con=engine, if_exists='append', index=False)
-        print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+        # Gravar dados no banco com método otimizado
+        print(f"    💾 Inserindo {len(empresa):,} registros no banco...")
+        
+        if DB_INSERT_WORKERS > 1 and len(empresa) > 100000:
+            # Usar inserção paralela para grandes volumes
+            inserted = parallel_insert(empresa, engine, 'empresa', DB_INSERT_WORKERS, DB_INSERT_BATCH_SIZE)
+            print(f'    ✅ {inserted:,} registros inseridos com sucesso!')
+        else:
+            # Usar inserção otimizada single-thread
+            inserted = to_sql_optimized(empresa, engine, 'empresa', DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+            print(f'    ✅ {inserted:,} registros inseridos com sucesso!')
+        
+        print(f'    ✅ Arquivo {arquivo} processado com sucesso!')
 
     except Exception as error:
         print(f'    ❌ Erro ao processar {arquivo}: {error}')
@@ -773,10 +1064,14 @@ for e, arquivo in enumerate(arquivos_estabelecimento, 1):
                                        'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1', 'ddd_2', 'telefone_2',
                                        'ddd_fax', 'fax', 'correio_eletronico', 'situacao_especial', 'data_situacao_especial']
 
-            # Gravar dados no banco
-            print(f"        💾 Inserindo {len(estabelecimento)} registros...")
-            to_sql(estabelecimento, name='estabelecimento', con=engine, if_exists='append', index=False)
-            print(f'        ✅ Lote {part + 1} inserido com sucesso!')
+            # Gravar dados no banco com método otimizado
+            print(f"        💾 Inserindo {len(estabelecimento):,} registros...")
+            
+            # Sempre usar método otimizado para estabelecimentos (grandes volumes)
+            inserted = to_sql_optimized(estabelecimento, engine, 'estabelecimento', 
+                                       DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+            
+            print(f'        ✅ Lote {part + 1} inserido com sucesso! ({inserted:,} registros)')
             
             if len(estabelecimento) < NROWS:
                 break
@@ -850,10 +1145,19 @@ for e, arquivo in enumerate(arquivos_socios, 1):
                           'qualificacao_socio', 'data_entrada_sociedade', 'pais', 'representante_legal',
                           'nome_do_representante', 'qualificacao_representante_legal', 'faixa_etaria']
 
-        # Gravar dados no banco
-        print(f"    💾 Inserindo {len(socios)} registros no banco...")
-        to_sql(socios, name='socios', con=engine, if_exists='append', index=False)
-        print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+        # Gravar dados no banco com método otimizado
+        print(f"    💾 Inserindo {len(socios):,} registros no banco...")
+        
+        if DB_INSERT_WORKERS > 1 and len(socios) > 100000:
+            # Usar inserção paralela para grandes volumes
+            inserted = parallel_insert(socios, engine, 'socios', DB_INSERT_WORKERS, DB_INSERT_BATCH_SIZE)
+            print(f'    ✅ {inserted:,} registros inseridos com sucesso!')
+        else:
+            # Usar inserção otimizada single-thread
+            inserted = to_sql_optimized(socios, engine, 'socios', DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+            print(f'    ✅ {inserted:,} registros inseridos com sucesso!')
+        
+        print(f'    ✅ Arquivo {arquivo} processado com sucesso!')
 
     except Exception as error:
         print(f'    ❌ Erro ao processar {arquivo}: {error}')
@@ -927,10 +1231,29 @@ if arquivos_simples:
                 simples.columns = ['cnpj_basico', 'opcao_pelo_simples', 'data_opcao_simples',
                                   'data_exclusao_simples', 'opcao_mei', 'data_opcao_mei', 'data_exclusao_mei']
                 
-                # Gravar dados no banco
-                print(f"            💾 Inserindo {len(simples)} registros...")
-                to_sql(simples, name='simples', con=engine, if_exists='append', index=False)
-                print(f'            ✅ Parte {i+1} inserida com sucesso!')
+                # Limpar dados antes de inserir
+                print(f"            🧹 Limpando dados...")
+                simples = clean_dataframe_for_insert(simples, 'simples')
+                
+                # Analisar problemas potenciais (opcional - comentar se quiser mais velocidade)
+                # analyze_dataframe_issues(simples, 'simples')
+                
+                # Gravar dados no banco com método otimizado
+                print(f"            💾 Inserindo {len(simples):,} registros...")
+                inserted = to_sql_optimized(simples, engine, 'simples', 
+                                          DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+                
+                # Verificar se houve perda de dados
+                if inserted < len(simples):
+                    loss_percent = ((len(simples) - inserted) * 100) / len(simples)
+                    print(f"            ⚠️ {len(simples) - inserted:,} registros não inseridos ({loss_percent:.2f}% de perda)")
+                    
+                    # Se a perda for significativa, fazer análise
+                    if loss_percent > 1:
+                        print(f"            📊 Analisando causa da perda...")
+                        analyze_dataframe_issues(simples, 'simples')
+                else:
+                    print(f'            ✅ Parte {i+1} inserida com sucesso! ({inserted:,} registros)')
                 
                 # Limpar memória
                 del simples
@@ -980,9 +1303,11 @@ if arquivos_cnae:
             
             cnae.columns = ['codigo', 'descricao']
             
-            print(f"    💾 Inserindo {len(cnae)} registros no banco...")
-            to_sql(cnae, name='cnae', con=engine, if_exists='append', index=False)
-            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            print(f"    💾 Inserindo {len(cnae):,} registros no banco...")
+            # Usar método otimizado mesmo para tabelas pequenas
+            inserted = to_sql_optimized(cnae, engine, 'cnae', 
+                                      DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+            print(f'    ✅ Arquivo {arquivo} processado! ({inserted:,} registros inseridos)')
             
         except Exception as error:
             print(f'    ❌ Erro ao processar {arquivo}: {error}')
@@ -1029,9 +1354,10 @@ if arquivos_moti:
             
             moti.columns = ['codigo', 'descricao']
             
-            print(f"    💾 Inserindo {len(moti)} registros no banco...")
-            to_sql(moti, name='moti', con=engine, if_exists='append', index=False)
-            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            print(f"    💾 Inserindo {len(moti):,} registros no banco...")
+            inserted = to_sql_optimized(moti, engine, 'moti', 
+                                      DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+            print(f'    ✅ Arquivo {arquivo} processado! ({inserted:,} registros inseridos)')
             
         except Exception as error:
             print(f'    ❌ Erro ao processar {arquivo}: {error}')
@@ -1078,9 +1404,10 @@ if arquivos_munic:
             
             munic.columns = ['codigo', 'descricao']
             
-            print(f"    💾 Inserindo {len(munic)} registros no banco...")
-            to_sql(munic, name='munic', con=engine, if_exists='append', index=False)
-            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            print(f"    💾 Inserindo {len(munic):,} registros no banco...")
+            inserted = to_sql_optimized(munic, engine, 'munic', 
+                                      DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+            print(f'    ✅ Arquivo {arquivo} processado! ({inserted:,} registros inseridos)')
             
         except Exception as error:
             print(f'    ❌ Erro ao processar {arquivo}: {error}')
@@ -1127,9 +1454,10 @@ if arquivos_natju:
             
             natju.columns = ['codigo', 'descricao']
             
-            print(f"    💾 Inserindo {len(natju)} registros no banco...")
-            to_sql(natju, name='natju', con=engine, if_exists='append', index=False)
-            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            print(f"    💾 Inserindo {len(natju):,} registros no banco...")
+            inserted = to_sql_optimized(natju, engine, 'natju', 
+                                      DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+            print(f'    ✅ Arquivo {arquivo} processado! ({inserted:,} registros inseridos)')
             
         except Exception as error:
             print(f'    ❌ Erro ao processar {arquivo}: {error}')
@@ -1176,9 +1504,10 @@ if arquivos_pais:
             
             pais.columns = ['codigo', 'descricao']
             
-            print(f"    💾 Inserindo {len(pais)} registros no banco...")
-            to_sql(pais, name='pais', con=engine, if_exists='append', index=False)
-            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            print(f"    💾 Inserindo {len(pais):,} registros no banco...")
+            inserted = to_sql_optimized(pais, engine, 'pais', 
+                                      DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+            print(f'    ✅ Arquivo {arquivo} processado! ({inserted:,} registros inseridos)')
             
         except Exception as error:
             print(f'    ❌ Erro ao processar {arquivo}: {error}')
@@ -1225,9 +1554,10 @@ if arquivos_quals:
             
             quals.columns = ['codigo', 'descricao']
             
-            print(f"    💾 Inserindo {len(quals)} registros no banco...")
-            to_sql(quals, name='quals', con=engine, if_exists='append', index=False)
-            print(f'    ✅ Arquivo {arquivo} inserido com sucesso!')
+            print(f"    💾 Inserindo {len(quals):,} registros no banco...")
+            inserted = to_sql_optimized(quals, engine, 'quals', 
+                                      DB_INSERT_METHOD, DB_INSERT_BATCH_SIZE, DB_COMMIT_INTERVAL)
+            print(f'    ✅ Arquivo {arquivo} processado! ({inserted:,} registros inseridos)')
             
         except Exception as error:
             print(f'    ❌ Erro ao processar {arquivo}: {error}')
